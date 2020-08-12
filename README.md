@@ -2,7 +2,7 @@
 
 Guide into creating a solar and battery powered tap water system, allowing for remote commanding via GSM (2G) network.
 
-<img src="https://manueldeprada.com/blog/assets/main.jpg" style="zoom:10%" />
+<img src="https://manueldeprada.com/blog/assets/main.jpg" style="zoom:10%" align="center" />
 ## Background
 
 This project may be useful to someone trying to solve some of the challenges of this problem. In fact, the tap system was the most trivial part of the project while the GSM communication and battery operation where the most difficult ones.
