@@ -2,7 +2,8 @@
 
 Guide into creating a solar and battery powered tap water system, allowing for remote commanding via GSM (2G) network.
 
-<img src="https://manueldeprada.com/blog/assets/main2.jpg" width=500px align="center" />
+<img src="https://manueldeprada.com/blog/assets/main.jpg" width=500px align="center" />
+
 ## Background
 
 This project may be useful to someone trying to solve some of the challenges of this problem. In fact, the tap system was the most trivial part of the project while the GSM communication and battery operation where the most difficult ones.
@@ -35,7 +36,7 @@ This type of systems may be needed in rural areas, where no AC current, wifi or 
 
 ![](https://manueldeprada.com/blog/assets/scheme.png)
 
-    ## Parts of the system
+## Parts of the system
 
 ### Powering
 
@@ -57,7 +58,7 @@ You can choose whatever resistor values you have available, given R1=2R2. The hi
 
 ### Water tap
 
-The water tap is essentially a DC motor that works with the 12V from the batteries. I just connect the ground to the batteries and I open or close the tap by switching the correct wire to 12V with the relays. Turning the relay module on or off is as simple as writing high or low value to a digital output pin with the arduino.
+The water tap is essentially a DC motor that works with the 12V from the batteries. I just connect the ground to the batteries and I open or close the tap by switching the correct wire to 12V with the relays. Turning the relay module on or off is as simple as writing high or low value to a digital output pin with the Arduino.
 
 ### Temperature Sensor
 
@@ -71,3 +72,185 @@ It communicates with the Arduino via serial interface. We could use the dedicate
 
 ## Software
 
+The software must handle lots of different things. 
+
+1. Monitor the temperature and charge level of the battery.
+2. Abstract the state of the water tap to ON and OFF, while turn on means "open first relay 10s" and turn off "open second relay 10s". Save the state of the tap into non volatile memory.
+3. Send to the server the state of the water tap and readings from temperature and battery. Get from the server the desired state of the tap valve and the amount of time to sleep between server checks.
+4. Sleep while not checking the server to save battery.
+
+### Reading temperature and battery charge
+
+The code to read analog inputs is very similar:
+
+```c++
+float getTemp(){
+  int value = analogRead(A1);
+  float millivolts = (value / 1023.0) * 5000;
+  float celsius = millivolts / 10; 
+  return celsius;
+}
+
+float getVoltaje(){
+  int value=analogRead(A0);
+  for(int i=0;i<9;i++){
+    value+=analogRead(A0);
+  }
+  value/=10;
+  return (value*5.0/1023.0)/0.3269550749;
+}
+```
+
+0.3269... is the constant I calculated  using the upper formulas to translate my voltage divider read value to the real 7.5-12V value of the battery.
+
+### Water tap valve management
+
+First, we need to store in the EEPROM whenever we change the state of the valve. Secondly, we need to code the transition between states:
+
+```c++
+void changeState(){
+  if(estadoRelay==0){//if tap is closed, we open it
+    digitalWrite(openPin, ON);
+    delay(10000);
+    digitalWrite(openPin, OFF);    
+    relayState=1;
+  }else{ //tap open, we close it
+    digitalWrite(closePin, ON);
+    delay(10000);
+    digitalWrite(closePin, OFF);    
+    relayState=0;
+  }
+  EEPROM.write(0, relayState); //write to EEPROM address 0 the new state
+}
+```
+
+### Server connection
+
+We will be using the GSMSim library. We initialise the GPRS module when booting the Arduino:
+
+```c++
+void initGprs(){
+  GPRSserial.begin(57600); //init serial comm with the device
+  while(!GPRSserial) {
+      ; // wait for module to connect.
+  }
+  gprs.reset();
+  gprs.init();
+  gprs.setPhoneFunc(1)
+  if(!gprs.isConnected()){
+    gprs.connect();
+  }else{
+    connectionFail=false;
+  }
+}
+```
+
+If we couldn't connect to the GPRS network, we set a flag so we can retry later.
+
+Now we need to code the way to send and retrieve the data from the server:
+
+```c++
+String syncServerData(){
+  String response= gprs.post("example.com/script.php", String("v=")+getVoltage()+"&e="+relayState, "application/x-www-form-urlencoded", true).substring(21);
+  if(response.substring(0,3).equals("200")){
+    response=response.substring(18,response.length());
+    return response;
+  }else{
+    Serial.print("ConnErr:");
+    Serial.println(response);
+    connectionFail=true;
+    return "0|10"; //If we are offline, we turn off the tap and we sleep a some time
+  }
+}
+```
+
+The response from the library is something like: `METHOD:POST|HTTPCODE:200|LENGTH:3|DATA:data`. We only care about the 200 status code and the data from the server.
+
+We need to write a server script to handle the incoming data, something like:
+
+```php
+<?php
+if ($_SERVER["REQUEST_METHOD"] == "POST") {
+  $voltaje = floatval( $_POST['v'] );
+  $estado = intval( $_POST['e'] );
+  $temp = floatval( $_POST['t'] );
+  if($temp>25.0){
+    sendTemperature($temp);
+  }
+  $sleep=-1;
+  $estadoNuevo=0;
+  updateDB($voltaje,$estado);
+  if ($voltaje < 8.0) {
+	  echo "0|".$sleep;
+  } else {
+	  echo $estadoNuevo."|".$sleep;
+  }
+} 
+function updateDB($v, $e)
+{	
+	global $sleep, $estadoNuevo; 
+	try {
+		$mng = new MongoDB\Driver\Manager("mongodb://....");
+		$filter = [ '_id' => 1 ]; 
+		$queryEstado = new MongoDB\Driver\Query($filter);     
+		$estadoNuevo = $mng->executeQuery("blabla.state", $queryEstado)->toArray()[0]->estado; //obtenemos el estado de la bd
+		
+		$querySleep = new MongoDB\Driver\Query([ '_id' => 2 ]);   
+		$sleep = $mng->executeQuery("blabla.state", $querySleep)->toArray()[0]->sleep; //obtenemos el sleep de la bd  
+		
+		$bulk = new MongoDB\Driver\BulkWrite;
+		$doc = ['_id' => new MongoDB\BSON\ObjectID, 'time' => new MongoDB\BSON\UTCDatetime, 'voltage' => $v, 'estado' => $e];
+		$bulk->insert($doc);			
+		$mng->executeBulkWrite('blabla.history', $bulk); //escribimos los nuevos datos en la bd
+			
+	} catch (MongoDB\Driver\Exception\Exception $e) {...}
+}
+?>
+```
+
+And you must also write a mechanism to update the state and sleep values in the server.
+
+### Power efficiency, Arduino loop and execution strategy
+
+We will try to be as power efficient as possible. The `setup()` method will be as follows:
+
+```c++
+void setup() {  
+  Serial.begin(115200);
+  initGprs();
+  pinMode(openPin, OUTPUT);
+  pinMode(closePin, OUTPUT);
+  digitalWrite(openPin, OFF);
+  digitalWrite(closePin, OFF);
+  relayState=EEPROM.read(0);
+}
+```
+
+Serial setup will be removed in the production version, it's just useful for debugging.
+
+In the `loop` we will be sleeping by default using the LowPower Arduino library. It will shutdown Arduino's chip buses and systems and setup a clock interruption in 8s (the longest period available). This allows to reduce Arduino's current from 0.044A to 0.029A. The rest of the current comes mostly from the linear voltage regulators, which are really inefficient. A further optimization would be to swap the main regulator of the Arduino for a nearly 100% efficient buck converter.
+
+So we are sleeping 8s a fixed amount of times:
+
+```c++
+void loop() {
+  if(currentCiclo<ciclosSleep){
+    currentCiclo++;
+    LowPower.powerDown(SLEEP_8S, ADC_OFF, BOD_OFF);
+    return;
+  }
+```
+
+When we exit the loop, we check for new data: the server will provide a new amount of rounds of sleep and a new state for the water tap.
+
+```c++
+  if (connectionFail) initGprs();
+  String s = syncServerData();
+  int newState = s.charAt(0) - '0';
+  ciclosSleep = s.substring(2).toInt();
+  if(newState!=relayState) changeState();
+  currentCiclo=0;
+}
+```
+
+And that's it. Our new autonomous water tap is now fully working!!
